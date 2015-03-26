@@ -148,6 +148,7 @@ typedef enum
 #define EVENT_END_JOB 501
 
 //const char pjl_status_cmd[] = "\e%-12345X@PJL INFO STATUS \r\n\e%-12345X";
+const char pjl_pagecount_cmd[] = "\e%-12345X@PJL ECHO sync \r\n@PJL INFO PAGECOUNT \r\n\e%-12345X";
 static const char pjl_ustatus_cmd[] = "\e%-12345X@PJL USTATUS DEVICE = ON \r\n@PJL USTATUS JOB = ON \r\n@PJL JOB \r\n\e%-12345X";
 static const char pjl_job_end_cmd[] = "\e%-12345X@PJL EOJ \r\n\e%-12345X";
 static const char pjl_ustatus_off_cmd[] = "\e%-12345X@PJL USTATUSOFF \r\n\e%-12345X";
@@ -346,6 +347,7 @@ static void pjl_read_thread(struct pjl_attributes *pa)
    enum HPMUD_RESULT stat;
    int len, new_status, new_eoj;
    char buf[1024];
+   int cnt = 0;
    
    pthread_detach(pthread_self());
 
@@ -356,7 +358,9 @@ static void pjl_read_thread(struct pjl_attributes *pa)
 
    while (!pa->abort)
    {
-      stat = get_pjl_input(pa->dd, pa->cd, buf, sizeof(buf), 0, &len);
+      if (cnt > (sizeof(buf)>>1) || strchr(buf, '\f')) cnt = 0;
+      stat = get_pjl_input(pa->dd, pa->cd, buf+cnt, sizeof(buf)-1-cnt, 0, &len);
+      cnt += len;
       if (!(stat == HPMUD_R_OK || stat == HPMUD_R_IO_TIMEOUT))
       {
          BUG("exiting thread %d error=%d\n", (int)pa->tid, stat);
@@ -687,6 +691,80 @@ static void save_out_file(int fd, int copies, FILE * temp_fp)
    }
 }
 
+void write_printacc_info(const char * printer, const char * user, int pages, int pagecnt_start, int pagecnt_end)
+{
+   int fd = -1, i;
+   time_t rawtime;
+   struct tm * timeinfo;
+   char buf1[128], buf2[4096];
+   const char * printacc_fifo = "/var/log/bk-printacc/bk-printacc.log";
+
+   time (&rawtime);
+   timeinfo = localtime (&rawtime);
+   strftime(buf1, 128, "%F %T", timeinfo);
+
+   for (i = 0; i < 3; ++i) {
+      fd = open(printacc_fifo, O_WRONLY | O_APPEND);
+      if (fd < 0)
+         sleep(1);
+      else
+         break;
+   }
+   if (fd < 0) {
+      BUG("can't open %d for write\n", printacc_fifo);
+      return;
+   }
+   snprintf(buf2, 4096, "%s %s %s %d %d %d\n", buf1, user, printer, pages, pagecnt_start, pagecnt_end);
+   if (write(fd, buf2, strnlen(buf2, 4096)) < 0) {
+       BUG("can't write to fifo: %s\n", buf2);
+   }
+   close(fd);
+}
+
+static int get_pagecount(HPMUD_DEVICE hd, HPMUD_CHANNEL cd)
+{
+   enum HPMUD_RESULT stat;
+   int len, i;
+   int pagecount=-1, sync = 0;
+   char * p = NULL;
+   char buf[1024];
+   int cnt = 0;
+
+   hpmud_write_channel(hd, cd, pjl_pagecount_cmd, sizeof(pjl_pagecount_cmd)-1, 5, &len);
+   for (i = 0; i < 16; ++i)
+   {
+      if (cnt > (sizeof(buf)>>1) || strchr(buf, '\f')) cnt = 0;
+      stat = get_pjl_input(hd, cd, buf+cnt, sizeof(buf)-1-cnt, 0, &len);
+      cnt += len;
+      if (!(stat == HPMUD_R_OK || stat == HPMUD_R_IO_TIMEOUT))
+      {
+         BUG("error in get_pagecount: %d\n", stat);
+         return -1;
+      }
+
+      if (stat == HPMUD_R_OK)
+      {
+         if (!sync && (p = strcasestr(buf, "ECHO sync")) != NULL) {
+            sync = 1;
+         } else {
+            p = buf;
+         }
+
+         if (sync && (p = strcasestr(p, "PAGECOUNT")) != NULL) {
+            sscanf(p+9, "%d", &pagecount);
+            DBG("got pagecount: %d\n", pagecount);
+            return pagecount;
+         }
+      }
+      else {
+         sleep(1);
+      }
+   }
+
+   return -1;
+}
+
+
 int main(int argc, char *argv[])
 {
    int fd;
@@ -697,12 +775,13 @@ int main(int argc, char *argv[])
    struct pjl_attributes pa;
    HPMUD_DEVICE hd=-1;
    HPMUD_CHANNEL cd=-1;
-   int n, total=0, retry=0, size, pages;
+   int n, total=0, retry=0, size, pages=-1;
    enum HPMUD_RESULT stat;
    char *printer = getenv("PRINTER"); 
    int iLogLevel = 0;
    FILE  *temp_fp = NULL;
    int saveoutfile = 0;
+   int pagecnt_start = -1, pagecnt_end = -1;
    
    //     0        1     2     3     4      5
    // device_uri job-id user title copies options
@@ -864,6 +943,8 @@ int main(int argc, char *argv[])
 
                if (pa.pjl_device)
                {
+                  pagecnt_start = get_pagecount(hd, cd);
+
                   /* Enable unsolicited status. */
                   hpmud_write_channel(hd, cd, pjl_ustatus_cmd, sizeof(pjl_ustatus_cmd)-1, 5, &len);
                   pa.dd = hd;
@@ -880,7 +961,6 @@ int main(int argc, char *argv[])
             } /* if (hd <= 0) */
 
             stat = hpmud_write_channel(hd, cd, buf+total, size, EXCEPTION_TIMEOUT, &n);
-
 
             if (n != size)
             {
@@ -928,7 +1008,7 @@ int main(int argc, char *argv[])
       hpmud_write_channel(hd, cd, pjl_job_end_cmd, sizeof(pjl_job_end_cmd)-1, 5, &len);
 
       /* Look for job end status. */
-      for (cnt=0; cnt<10; cnt++)
+      for (cnt=0; cnt<100; cnt++)
       {
          if (loop_test(hd, cd, &pa, argv[0], printer, argv[2], argv[1], argv[3]))
          {
@@ -946,7 +1026,6 @@ int main(int argc, char *argv[])
          DBG("waiting for job end status...\n");
          sleep(2);
       }
-
       hpmud_write_channel(hd, cd, pjl_ustatus_off_cmd, sizeof(pjl_ustatus_off_cmd)-1, 5, &len);
    }
    else if ((ma.prt_mode != HPMUD_UNI_MODE) && (ma.statustype == HPMUD_STATUSTYPE_SFIELD))
@@ -989,6 +1068,8 @@ bugout:
       pthread_cancel(pa.tid);   
       pthread_mutex_destroy(&pa.mutex);
       pthread_cond_destroy(&pa.done_cond);
+      if (hd >= 0 && cd >= 0)
+          pagecnt_end = get_pagecount(hd, cd);
    }
 
    if (cd >= 0)
@@ -1000,6 +1081,7 @@ bugout:
    if (temp_fp)
       fclose(temp_fp);
 
+   write_printacc_info(argv[0], argv[2], pages, pagecnt_start, pagecnt_end);
+
    exit (exit_stat);
 }
-
